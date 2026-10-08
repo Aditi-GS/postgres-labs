@@ -13,6 +13,11 @@
 
 ## 1. Setup
 
+Get the posgres data directory - <u>***$PGDATA***</u>
+```sql
+SHOW data_directory
+```
+
 `pg_buffercache` - look inside shared buffers
 
 ```console
@@ -42,7 +47,7 @@ SELECT count(*) FILTER (WHERE isdirty) AS dirty, count(*) AS total FROM pg_buffe
 
 Latest checkpoint and redo's location from the `pg_control` file
 ```console
-sudo -u postgres pg_controldata /var/lib/pgsql/data | grep -iE "checkpoint|redo"
+sudo -u postgres pg_controldata <$PGDATA> | grep -iE "checkpoint|redo"
 ```
 ![cli 1](cli-1.png)
 
@@ -142,12 +147,12 @@ SELECT pg_current_wal_lsn(), pg_walfile_name(pg_current_wal_lsn());
 ```
 
 ```console
-sudo -u postgres pg_waldump -p /var/lib/pgsql/data/pg_wal -s 0/5658698 -e 0/565BB60 000000010000000000000005
+sudo -u postgres pg_waldump -p <$PGDATA>/pg_wal -s 0/5658698 -e 0/565BB60 000000010000000000000005
 ```
 ![cli 2](cli-2.png)
 
 ```console
-sudo -u postgres pg_waldump -p /var/lib/pgsql/data/pg_wal -s 0/5658698 -e 0/565BB60 000000010000000000000005
+sudo -u postgres pg_waldump -p <$PGDATA>/pg_wal -s 0/5658698 -e 0/565BB60 000000010000000000000005
 ```
 
 ```console
@@ -239,100 +244,6 @@ applies to timed checkpoints.
 ---
 
 ## Side Notes
-
-> Reading WAL LSN and WAL Filename
-
-A single hex digit consists of 4 bits
-
-1 byte = 2 hex digits = 2^8 = 8 bits
-
-0 - 9, A = 10, ..., F = 15
-
-1 byte = FF = 256
-
-Each WAL segment is 16 MB.
-```sql
-SHOW wal_segment_size;
-```
-
-Each WAL segment consists of WAL records (lowest level description of change applied to the database)
-The size of each WAL record is variable. It has to be atleast 24 bytes (header). The totatl size of the record is `xl_tot_len`
-
-```c
-typedef struct XLogRecord
-{
-    uint32      xl_tot_len;     /* total len of entire record (header + body) */
-    TransactionId xl_xid;
-    XLogRecPtr  xl_prev;        /* LSN of previous record */
-    .....
-} XLogRecord;   
-```
-
-Each segment is 16 MB size.
-
-The `Log Sequence Number (LSN)` is a 64-bit number that acts as a byte address into one continuous, ever-growing logical stream of WAL data.
-
-The 64-bit Layout: 
-
-```
-XXXXXXXX / YY ZZZZZZ
-  │         │   │
-  │         │   |- 6 hex chars = 3 bytes = 24 bits => byte offset WITHIN the
-  |         |                                          16 MB segment
-  │         |----- 2 hex chars = 1 byte  =  8 bits => which segment (0–255) 
-  |                                                    in the group
-  |--------------- 8 hex chars = 4 bytes = 32 bits => group number   
-```
-
-Segment groups are a numbering convention (not a physical unit). It's not a physical directory, partition, or allocation. It's just how the 64-bit LSN is sliced. Out of 16 MB (16,777,216 bytes) of WAL, ZZZZZZ indicates at what byte the WAL record starts from.
-Max of YY is FF which is equal to 256 consecutive segment files. 
-
-Think of it as a chapter (group) in a book. Each chapter (group) contains 256 pages (segments). Each page has 16 MB (WAL) of content. So each chapter contains 256 x 16 MB worth of content = 4 GB of content (WAL). The chapter number is just a counter.
-
-The group number (XXXXXXXX) counter is incremented by everytime 256 segments or 4GB WAL content is crossed. 
-
-Total number of groups = FFFFFFFF = = 2³² = 4,294,967,296 (about 4.3 billion).
-Total addressable bytes: 4.3 billion × 4 GB ≈ 16 exabytes.
-This is purely a numbering ceiling — the maximum value the 32-bit group counter can hold before wrapping.
-
-```
-TTTTTTTTXXXXXXXXYYYYYYYY
-│       │        │       │
-│       │        │       |--- "000000" (always 6 zeros — structural padding)
-│       │        |----------- YY (2 hex chars: segment index 0–255)
-│       |-------------------- XXXXXXX (8 hex chars: group number, zero-padded)
-|---------------------------- TTTTTTTT (8 hex chars: timeline ID, usually 1)  
-```
-
-The physical pg_wal/ directory holds a small sliding window of 16 MB segment files, sized by max_wal_size + min_wal_size + replication lag. Old segments are recycled (renamed to future positions) or removed (deleted) at each checkpoint to keep disk usage bounded. 
-
-```sql
--- LSN: segment filename
-SELECT pg_walfile_name('5D/257E19B0');
--- 000000010000005D00000025
--- timeline | segment group | segment file
--- 1        | 5D = 93       | 25 = 37
-
--- LSN: filename + byte offset within that segment
-SELECT * FROM pg_walfile_name_offset('5D/257E19B0');
---  file_name                | file_offset
---  000000010000005D00000025 | 8264112
-
--- filename: segment number + timeline
-SELECT * FROM pg_split_walfile_name('000000010000005D00000025');
---  segment number | timeline_id
---  23845          | 1
-```
-
-> 8 byte alignment
-
-Every WAL record starts at an LSN that is a multiple of 8, so if a record's actual length isn't a multiple of 8, Postgres leaves a few unused padding bytes after it before the next record begins.
-
-The next record's start = current record's start + `xl_tot_len`, rounded up to the next multiple of 8. The rounding on 64-bit platforms MAXALIGN is 8.
-
-`pg_waldump` prints `xl_tot_len` (example: 30, 50, 114), which excludes padding.
-LSN differences (0x20, 0x38, 0x78) include padding, because the next record's LSN is the aligned position.
-That is why the LSNs in your output all end in hex digits that are multiples of 8 (...900, ...958, ...A08), i.e. the last hex digit is always 0 or 8.
 
 > Checksums
 
